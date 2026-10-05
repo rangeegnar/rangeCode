@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import time
@@ -45,16 +44,9 @@ class MemoryEntry:
         self.content = content
 
 
-
-
-def _project_hash() -> str:
-    """用当前工作目录生成稳定 hash，让不同项目的记忆互相隔离。"""
-    return hashlib.sha256(str(Path.cwd()).encode()).hexdigest()[:16]
-
-
 def get_memory_dir() -> Path:
-    """返回当前项目的 memory 目录，不存在时自动创建。"""
-    d = Path.home() / ".BearCode" / "projects" / _project_hash() / "memory"
+    """返回当前项目的 memory 目录（项目根 .bear/memory），不存在时自动创建。"""
+    d = Path.cwd() / ".bear" / "memory"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
