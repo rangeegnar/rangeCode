@@ -73,9 +73,15 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
 
 
 def _clean_env(value: str | None) -> str | None:
+    """去掉首尾空白与行尾注释。
+
+    行尾注释必须剥掉：dotenv 会把 ``KEY=value # note`` 的整行（含注释）放进
+    ``os.environ``。若整行被当成模型名或 base URL 发出去，接口会直接 401/400。
+    这里是全项目解析环境变量的唯一出口，所以在这一层统一处理。
+    """
     if value is None:
         return None
-    value = value.strip()
+    value = value.split("#")[0].strip()
     return value or None
 
 
@@ -377,7 +383,9 @@ Examples:
     # 将命令行布尔开关统一转换成 Agent 内部使用的权限模式。
     permission_mode = _resolve_permission_mode(args)
     # 模型优先使用命令行参数，其次读取 .env 中的 MODEL，最后回落到默认模型。
-    model = args.model or os.environ.get("MODEL") or "deepseek-chat"
+    model = _clean_env(args.model) or _clean_env(os.environ.get("MODEL")) or "deepseek-chat"
+    # 向量模型也只在这里解析一次；TierMem 不再自己读环境变量
+    embedding_model = _clean_env(os.environ.get("VECTOR_MODEL")) or ""
     resolved_api_base, resolved_api_key, resolved_use_openai = _resolve_api_config(args.api_base)
 
     # 没有可用 API key 时无法调用模型，直接提示配置方式并退出。
@@ -400,6 +408,7 @@ Examples:
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
+        embedding_model=embedding_model,
     )
 
     # Resume session
@@ -409,9 +418,14 @@ Examples:
         if session_id:
             session = load_session(session_id)
             if session:
+                # 接管被恢复会话的 id：TierMem 按 session_id 分目录存储，
+                # 不接管就会用新生成的 id 去开一个空目录，恢复出来的历史没有对应记忆。
+                agent.session_id = session_id
                 agent.restore_session({
                     "anthropicMessages": session.get("anthropicMessages"),
                     "openaiMessages": session.get("openaiMessages"),
+                    # restore_session 支持这个字段，之前没传，恢复后归档记录会丢
+                    "tierMemArchives": session.get("tierMemArchives"),
                 })
             else:
                 print_info("No session found to resume.")

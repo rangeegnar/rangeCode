@@ -90,10 +90,10 @@ def _discover_custom_agents() -> dict[str, dict]:
         return _cached_custom_agents
 
     agents: dict[str, dict] = {}
-    # User-level (lower priority)
-    _load_agents_from_dir(Path.home() / ".bear" / "agents", agents)
-    # Project-level (higher priority, overwrites)
-    _load_agents_from_dir(Path.cwd() / ".bear" / "agents", agents)
+    # 次优先：建议设置为全局
+    # _load_agents_from_dir()
+    # 优先：.bear/agents/（项目级，同名覆盖上面那个）
+    _load_agents_from_dir(Path.cwd() / ".bear" / "multiagent", agents)
 
     _cached_custom_agents = agents
     return agents
