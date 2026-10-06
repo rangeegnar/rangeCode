@@ -17,16 +17,9 @@ import openai
 from agents.mcp_client import McpManager
 from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
 from agents.prompt import build_system_prompt
-from agents.session_memory import (
-    FOLD_SESSION_MEMORY_SYSTEM,
-    build_anthropic_transcript,
-    build_folding_user_prompt,
-    build_openai_transcript,
-    fallback_folded_memory,
-    format_folded_memory,
-    parse_folded_memory,
-)
-from agents.session import save_folded_session_memory, save_session
+from agents.TierMem import TierMem, config as tier_config, format_page_id
+from agents.TierMem.llm import AgentChatLLM, HttpLLM, LLMProtocol
+from agents.session import save_session
 from agents.subagent import get_sub_agent_config
 from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
     get_active_tool_definitions
@@ -92,7 +85,7 @@ MODEL_CONTEXT = {
 }
 
 def _get_context_windows(model:str)->int:
-    return MODEL_CONTEXT.get(model, 200000)
+    return MODEL_CONTEXT.get(model, 20000) # 20000用于测试
 
 
 #多层级压缩常数
@@ -139,6 +132,7 @@ class Agent:
                  api_base: str | None=None,
                  anthropic_base_url: str | None=None,
                  api_key: str | None=None,
+                 embedding_model: str | None=None,
                  thinking: bool=False,
                  max_cost_usd: float | None=None,
                  max_turns: int | None=None,
@@ -149,6 +143,10 @@ class Agent:
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
+        # 这三项由 agents/main.py 解析后注入，TierMem 直接复用，不自己读环境变量
+        self.api_base = api_base or anthropic_base_url
+        self.api_key = api_key
+        self.embedding_model = embedding_model or ""
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
         self.tools = custom_tools or tool_definitions
@@ -207,9 +205,15 @@ class Agent:
         self._last_retrieved_skill_hits: list[dict[str, Any]] = []
         self._pending_skill_extraction_window: dict[str, Any] | None = None
         self._background_skill_tasks: set[asyncio.Task] = set()
-        self._folded_session_memories: list[dict[str, Any]] = []
-        self._fold_last_time: float = 0.0
-        self._fold_count: int = 0
+        # TierMem 两级记忆：会话原文封存成不可变的 Tier-2 页 + 带溯源的 Tier-1 摘要。
+        # 取代原先的 session_memory 会话折叠——折叠会把原文删掉，TierMem 不会。
+        self._tier_mem: TierMem | None = None
+        self._tier_mem_archives: list[dict[str, Any]] = []
+        self._background_tier_tasks: set[asyncio.Task] = set()
+        self._archive_last_time: float = 0.0
+        self._archive_count: int = 0
+        self._tier_mem_bytes: int = 0
+        
         self._tool_error_streak: int = 0
         self._same_tool_repeat_count: int = 0
         self._last_tool_name: str = ""
@@ -263,7 +267,9 @@ class Agent:
 
     #生成一个用于保存 AI 计划（Plan）的 Markdown 文件的绝对路径。
     def _generate_plan_file_path(self) -> str:
-        d = Path.home() / ".bear" / "plans"
+        # 放项目内而不是 ~/.bear：沙箱下用户主目录只给读+执行权限，mkdir 会抛
+        # PermissionError: [WinError 5]。
+        d = Path.cwd() / ".bear" / "plan"
         d.mkdir(parents=True, exist_ok=True)
         return str(d / f"plan-{self.session_id}.md")
 
@@ -473,19 +479,25 @@ class Agent:
         else:
             print_assistant_text(text)
 
-    def _build_fold_guidance_section(self) -> str:
+    def _build_archive_guidance_section(self) -> str:
         if self._custom_system_prompt is not None:
             return ""
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0.0
-        last_fold = "never" if not self._fold_last_time else f"{int((time.time() - self._fold_last_time) / 60)}m ago"
+        last_archive = "never" if not self._archive_last_time else f"{int((time.time() - self._archive_last_time) / 60)}m ago"
+        memory = self._tier_mem
+        scale = (
+            f"- TierMem scale: {memory.store.count()} pages / {memory.index.count()} units\n"
+            if memory is not None else ""
+        )
         return (
-            "\n\n# Runtime Fold Guidance\n"
+            "\n\n# Runtime Context Guidance\n"
             f"- Current context utilization: {utilization:.0%}\n"
             f"- Recent tool error streak: {self._tool_error_streak}\n"
             f"- Same tool repeat count: {self._same_tool_repeat_count}\n"
-            f"- Last fold: {last_fold}\n"
+            f"- Last archive: {last_archive}\n"
+            + scale +
             "- If the context is getting long, the same tool is being retried without progress, or tool failures are accumulating, call `compact_context` before trying more tools.\n"
-            "- If you folded very recently and the next step is clear, prefer continuing rather than folding again.\n"
+            "- `compact_context` archives the transcript into TierMem and keeps it retrievable; it discards nothing, so it is safe to call early.\n"
         )
 
     def _refresh_runtime_system_prompt(self) -> None:
@@ -496,7 +508,7 @@ class Agent:
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
         else:
             self._system_prompt = self._base_system_prompt
-        self._system_prompt += self._build_fold_guidance_section()
+        self._system_prompt += self._build_archive_guidance_section()
         if self.use_openai and self._openai_messages:
             self._openai_messages[0]["content"] = self._system_prompt
 
@@ -511,9 +523,9 @@ class Agent:
         else:
             self._tool_error_streak += 1
 
-    def _record_fold_event(self) -> None:
-        self._fold_last_time = time.time()
-        self._fold_count += 1
+    def _record_archive_event(self) -> None:
+        self._archive_last_time = time.time()
+        self._archive_count += 1
         self._tool_error_streak = 0
         self._same_tool_repeat_count = 0
         self._last_tool_name = ""
@@ -721,8 +733,8 @@ class Agent:
         self._pending_skill_extraction_window = None
         self._last_retrieved_skill_reference = None
         self._last_retrieved_skill_hits = []
-        self._fold_last_time = 0.0
-        self._fold_count = 0
+        self._archive_last_time = 0.0
+        self._archive_count = 0
         self._tool_error_streak = 0
         self._same_tool_repeat_count = 0
         self._last_tool_name = ""
@@ -754,7 +766,7 @@ class Agent:
 
     #压缩会话
     async def compact(self)->None:
-        compacted = await self._compact_conversation(trigger="manual")
+        compacted = await self._archive_conversation(trigger="manual")
         if not compacted:
             print_info("Nothing to compact yet.")
 
@@ -765,8 +777,8 @@ class Agent:
             self._anthropic_messages = self._normalize_anthropic_messages(_sanitize_for_utf8(data["anthropicMessages"]))
         if data.get("openaiMessages"):
             self._openai_messages = _sanitize_for_utf8(data["openaiMessages"])
-        if isinstance(data.get("foldedSessionMemories"), list):
-            self._folded_session_memories = _sanitize_for_utf8(data["foldedSessionMemories"])
+        if isinstance(data.get("tierMemArchives"), list):
+            self._tier_mem_archives = _sanitize_for_utf8(data["tierMemArchives"])
         print_info(f"Session restored ({self._get_message_count()} messages).")
 
 
@@ -838,81 +850,214 @@ class Agent:
                 },
                 "anthropicMessages": _sanitize_for_utf8(self._anthropic_messages) if not self.use_openai else None,
                 "openaiMessages": _sanitize_for_utf8(self._openai_messages) if self.use_openai else None,
-                "foldedSessionMemories": _sanitize_for_utf8(self._folded_session_memories),
+                "tierMemArchives": _sanitize_for_utf8(self._tier_mem_archives),
             })
-        except Exception:
-            pass
+        except Exception as exc:
+            print_error(f"Session auto-save failed: {type(exc).__name__}: {exc}")
 
     #自动压缩
     async def _check_and_compact(self)->None:
         if self.last_input_token_count > self.effective_window * AUTO_COMPACT_THRESHOLD:
             print_info("Context window filling up, compacting conversation...")
-            await self._compact_conversation(trigger="auto")
+            await self._archive_conversation(trigger="auto")
 
-    async def _compact_conversation(self, *, trigger: str = "manual")->bool:
+    async def _archive_conversation(self, *, trigger: str = "manual")->bool:
         if self.use_openai:
-            compacted = await self._compact_openai(trigger=trigger)
+            compacted = await self._archive_openai(trigger=trigger)
         else:
-            compacted = await self._compact_anthropic(trigger=trigger)
+            compacted = await self._archive_anthropic(trigger=trigger)
         if compacted:
             print_info("Conversation compacted.")
         return compacted
 
-    async def _compact_anthropic(self, *, trigger: str)->bool:
-        if len (self._anthropic_messages)<4:
+    async def _archive_anthropic(self, *, trigger: str)->bool:
+        if len(self._anthropic_messages) < 4:
             return False
+        payload = _sanitize_for_utf8(self._anthropic_messages)
+        if not any(TierMem.message_text(m).strip() for m in payload if isinstance(m, dict)):
+            return False
+        return await self._archive_messages(payload, trigger=trigger, use_openai=False)
 
-        transcript = build_anthropic_transcript(_sanitize_for_utf8(self._anthropic_messages))
-        if not transcript.strip():
+    async def _archive_openai(self, *, trigger: str)->bool:
+        if len(self._openai_messages) < 4:
             return False
-        memory = await self._generate_folded_session_memory(transcript)
-        self._record_folded_session_memory(trigger, memory)
-        self._record_fold_event()
-        self._anthropic_messages = [{"role": "user", "content": format_folded_memory(memory)}]
-        self.last_input_token_count = 0
-        self._refresh_runtime_system_prompt()
-        return True
-
-    async def _compact_openai(self, *, trigger: str)->bool:
-        if len (self._openai_messages)<4:
-            return False
-        system_msg = self._openai_messages[0]
-        transcript = build_openai_transcript(_sanitize_for_utf8(self._openai_messages))
-        if not transcript.strip():
-            return False
-        memory = await self._generate_folded_session_memory(transcript)
-        self._record_folded_session_memory(trigger, memory)
-        self._record_fold_event()
-        self._openai_messages=[
-            system_msg,
-            {"role": "user", "content": format_folded_memory(memory)},
+        # 跳过 system 消息：它每轮都由 _refresh_runtime_system_prompt 重建，归档没有意义。
+        payload = [
+            m for m in _sanitize_for_utf8(self._openai_messages)
+            if isinstance(m, dict) and m.get("role") != "system"
         ]
-        self.last_input_token_count=0
+        if not payload:
+            return False
+        return await self._archive_messages(payload, trigger=trigger, use_openai=True)
+
+    async def _archive_messages(self, messages: list[dict], *, trigger: str, use_openai: bool) -> bool:
+        """把整段对话封存进 TierMem，然后用一段归档说明替换掉历史。
+
+        与原来的会话折叠有本质区别：**原文没有被丢弃**。Tier-2 保留逐页原文，
+        Tier-1 保留带溯源链接的摘要，之后可以按需升级回原文重新核对。
+        因此这一步不再调用模型做压缩——归档说明是纯字符串拼装。
+        """
+        # 子 agent 与总开关关闭时不构造 TierMem，避免它去索取凭据
+        if self.is_sub_agent or not tier_config.ENABLED:
+            return False
+        memory = self._tier_memory()
+
+        page_before = memory.store.count()
+        unit_before = memory.index.count()
+        try:
+            await memory.ingest(messages, session=self.session_id)
+        except Exception as exc:
+            # 归档失败就保留原历史：宁可上下文继续变长，也不能把原文弄丢
+            print_error(f"TierMem archive failed, keeping original history: {exc}")
+            return False
+
+        self._record_archive_event()
+        self._append_archive_record(trigger, memory, page_before, unit_before)
+        note = self._build_archive_note(trigger, memory, page_before, unit_before)
+
+        if use_openai:
+            system_msg = self._openai_messages[0]
+            self._openai_messages = [system_msg, {"role": "user", "content": note}]
+        else:
+            self._anthropic_messages = [{"role": "user", "content": note}]
+        self.last_input_token_count = 0
+        # 历史刚被替换，TierMem 之前注入的证据也随之消失，注入预算必须同步归零。
+        # 否则 session_bytes 只增不减，耗尽后升级会在整个进程生命周期内永久失效。
+        memory.reset_session_budget()
         self._refresh_runtime_system_prompt()
+        self._auto_save()
         return True
 
-    async def _generate_folded_session_memory(self, transcript: str) -> dict[str, Any]:
-        side_query = self._build_side_query(max_tokens=6000)
-        if side_query is None:
-            return fallback_folded_memory(transcript)
-        try:
-            raw = await side_query(FOLD_SESSION_MEMORY_SYSTEM, build_folding_user_prompt(transcript))
-            return parse_folded_memory(raw)
-        except Exception:
-            return fallback_folded_memory(transcript)
+    # ── TierMem：两级记忆（取代原先的会话折叠） ─────────────
+    def _build_tier_mem_llm(self) -> LLMProtocol:
+        """把 Agent 自己的调用包装成 TierMem 需要的模型协议。
 
-    def _record_folded_session_memory(self, trigger: str, memory: dict[str, Any]) -> None:
-        record = {
+        chat 复用 Agent 已配好鉴权的 side query；embedding 走独立的 OpenAI 兼容
+        端点，因为对话客户端没有向量能力。四项参数全部来自 main.py 的解析结果，
+        TierMem 不重复读环境变量。
+        """
+        async def _chat(system: str, user: str, *, max_tokens: int) -> str:
+            side_query = self._build_side_query(max_tokens=max_tokens)
+            return await side_query(system, user)
+
+        if not self.api_base or not self.api_key or not self.embedding_model:
+            raise RuntimeError(
+                "TierMem 需要 api_base / api_key / embedding_model；"
+                "请在 .env 里设置 API / APIKEY / VECTOR_MODEL"
+                "（由 agents/main.py 解析后注入 Agent）"
+            )
+        embed_client = HttpLLM(
+            api_base=self.api_base,
+            api_key=self.api_key,
+            chat_model=self.model,
+            embedding_model=self.embedding_model,
+        )
+        return AgentChatLLM(_chat, embed_client)
+
+    def _tier_memory(self) -> TierMem:
+        """懒加载 TierMem。子 agent 不参与记忆，避免把临时任务的原文写进项目记忆。
+
+        存储目录按 ``session_id`` 隔离（``.bear/tier_memory/<session_id>/``）：
+        不同会话的页、摘要与向量互不可见，也不会互相召回。
+        """
+        if self._tier_mem is None:
+            self._tier_mem = TierMem(
+                root=tier_config.session_root(self.session_id),
+                llm=self._build_tier_mem_llm(),
+                summary_mode=tier_config.SUMMARY_MODE,
+                enabled=tier_config.ENABLED and not self.is_sub_agent,
+            )
+        return self._tier_mem
+
+    def start_tier_mem_prefetch(self, query: str) -> asyncio.Task | None:
+        """启动一次异步召回，与主模型调用并行。
+
+        索引为空时直接返回 None：第一次归档之前没有任何东西可召回，
+        这样不会白白产生「路由 + 回答」两次模型调用。
+        """
+        if self.is_sub_agent:
+            return None
+        memory = self._tier_memory()
+        if not memory.enabled or memory.index.count() == 0:
+            return None
+        if len(query.strip()) < tier_config.MIN_QUERY_CHARS:
+            return None
+        return asyncio.create_task(memory.query(query))
+
+    async def _inject_tier_mem_result(self, task: asyncio.Task, *, use_openai: bool) -> None:
+        """把 TierMem 召回结果注入当前对话，并把升级验证过的结论写回索引。"""
+        try:
+            trace = task.result()
+        except Exception:
+            return
+        text = TierMem.format_for_injection(trace)
+        if not text:
+            return
+        text = _safe_utf8_text(text)
+        messages = self._openai_messages if use_openai else self._anthropic_messages
+        if not messages:
+            return
+        last = messages[-1] if isinstance(messages[-1], dict) else None
+        if last is not None and last.get("role") == "user":
+            content = last.get("content", "")
+            if isinstance(content, str):
+                last["content"] = content + "\n\n" + text
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": text})
+        else:
+            messages.append({"role": "user", "content": text})
+        self._tier_mem_bytes += len(text.encode())
+
+        # 走了升级路径说明摘要不够用，把这次验证过的结论沉淀回索引，下次就不用再升级
+        if trace.get("mode") == "escalated" and tier_config.ENABLE_WRITEBACK:
+            question = str(trace.get("question") or "")
+            memory = self._tier_memory()
+            background = asyncio.create_task(memory.commit(question, trace))
+            self._background_tier_tasks.add(background)
+            background.add_done_callback(self._background_tier_tasks.discard)
+
+    @staticmethod
+    def _format_page_range(before: int, after: int) -> str:
+        if after <= before:
+            return "-"
+        return f"{format_page_id(before + 1)}..{format_page_id(after)}"
+
+    def _append_archive_record(self, trigger: str, memory: TierMem,
+                               page_before: int, unit_before: int) -> None:
+        self._tier_mem_archives.append({
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "trigger": trigger,
             "session_id": self.session_id,
-            **memory,
-        }
-        self._folded_session_memories.append(record)
-        try:
-            save_folded_session_memory(self.session_id, _sanitize_for_utf8(record))
-        except Exception:
-            pass
+            "pages_before": page_before,
+            "pages_after": memory.store.count(),
+            "units_before": unit_before,
+            "units_after": memory.index.count(),
+            "summary_mode": memory.summary_mode,
+        })
+
+    def _build_archive_note(self, trigger: str, memory: TierMem,
+                            page_before: int, unit_before: int) -> str:
+        """归档之后替换历史的那段说明。纯字符串拼装，不调用模型。"""
+        page_after = memory.store.count()
+        unit_after = memory.index.count()
+        lines = [
+            "<session-archive>",
+            "上一段对话已经封存进 TierMem 两级记忆，原文没有被丢弃，可以按需取回。",
+            f"- 归档触发: {trigger}",
+            f"- 本次新增 Tier-2 原始页: {page_after - page_before} 页"
+            f"（{self._format_page_range(page_before, page_after)}，不可变、页号稳定）",
+            f"- 本次新增 Tier-1 摘要单元: {unit_after - unit_before} 个（每条都带指向原始页的溯源链接）",
+            f"- 当前规模: {page_after} 页 / {unit_after} 个单元，摘要模式 {memory.summary_mode}",
+            "",
+            "继续任务。需要过去的细节时不要凭记忆猜：默认读摘要，摘要缺少决定性约束"
+            "（否定、精确值、归因、顺序）时会自动升级去读原始日志。",
+            "涉及文件内容或环境状态时仍然要重新读盘确认，记忆只是当时的观察。",
+        ]
+        index_block = memory.render_index()
+        if index_block:
+            lines.extend(["", index_block])
+        lines.append("</session-archive>")
+        return "\n".join(lines)
 
     #多层级压缩流水线
     def _run_compression_pipeline(self)->None:
@@ -1072,7 +1217,9 @@ class Agent:
         if (len (result.encode())) <= THRESHOLD:
             return result
 
-        d = Path.home() / ".bear-code" / "tool-results"
+        # 放项目内而不是用户主目录：沙箱下主目录只给读+执行权限，mkdir 会直接
+        # 抛 PermissionError（WinError 5），而这里没有任何 try 保护，会打断工具循环。
+        d = Path.cwd() / ".bear" / "tool-results"
         d.mkdir(parents=True, exist_ok=True)
         filename = f"{int(time.time() * 1000)}-{tool_name}.txt"
         filepath = d / filename
@@ -1115,7 +1262,7 @@ class Agent:
 
     async def _execute_compact_context_tool(self, inp: dict) -> str:
         reason = str(inp.get("reason") or "").strip()
-        compacted = await self._compact_conversation(trigger="tool")
+        compacted = await self._archive_conversation(trigger="tool")
         if not compacted:
             self._record_tool_outcome("compact_context", False)
             return "No context compaction was performed because there is not enough conversation history yet."
@@ -1123,8 +1270,8 @@ class Agent:
         self._context_cleared = True
         suffix = f"\nReason: {reason}" if reason else ""
         return (
-            "Context compacted into structured session memory. "
-            "Continue from the folded memory now present in the conversation context."
+            "Context archived into TierMem (immutable raw pages + provenance-linked summaries). "
+            "Nothing was discarded; continue from the archive note now present in the conversation context."
             f"{suffix}"
         )
 
@@ -1252,8 +1399,8 @@ class Agent:
         if self.use_openai:
             self._openai_messages.append({"role": "system", "content": self._system_prompt})
         self.last_input_token_count = 0
-        self._fold_last_time = 0.0
-        self._fold_count = 0
+        self._archive_last_time = 0.0
+        self._archive_count = 0
         self._tool_error_streak = 0
         self._same_tool_repeat_count = 0
         self._last_tool_name = ""
@@ -1301,6 +1448,13 @@ class Agent:
                     user_message, sq,
                     self._already_surfaced_memories, self._session_memory_bytes,
                 )
+
+        # TierMem 召回同样在后台跑，与主模型调用并行；索引为空时不会产生任何调用。
+        tier_mem_prefetch: asyncio.Task | None = None
+        tier_mem_consumed = False
+        if not self.is_sub_agent:
+            tier_mem_prefetch = self.start_tier_mem_prefetch(user_message)
+
         while True:
             # 外部请求中止时，结束整个 agent loop。
             if self._aborted:
@@ -1338,6 +1492,10 @@ class Agent:
                 except:
                     # memory 注入失败不应该中断主对话流程。
                     pass
+
+            if tier_mem_prefetch and tier_mem_prefetch.done() and not tier_mem_consumed:
+                tier_mem_consumed = True
+                await self._inject_tier_mem_result(tier_mem_prefetch, use_openai=False)
 
             if not self.is_sub_agent:
                 start_spinner()
@@ -1592,6 +1750,12 @@ class Agent:
                     self._already_surfaced_memories, self._session_memory_bytes,
                 )
 
+        # TierMem 召回同样在后台跑，与主模型调用并行；索引为空时不会产生任何调用。
+        tier_mem_prefetch: asyncio.Task | None = None
+        tier_mem_consumed = False
+        if not self.is_sub_agent:
+            tier_mem_prefetch = self.start_tier_mem_prefetch(user_message)
+
         while True:
             if self._aborted:
                 break
@@ -1617,6 +1781,10 @@ class Agent:
                             self._session_memory_bytes += len(m.content.encode())
                 except Exception:
                     pass
+
+            if tier_mem_prefetch and tier_mem_prefetch.done() and not tier_mem_consumed:
+                tier_mem_consumed = True
+                await self._inject_tier_mem_result(tier_mem_prefetch, use_openai=True)
 
             if not self.is_sub_agent:
                 start_spinner()
