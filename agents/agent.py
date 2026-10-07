@@ -238,7 +238,7 @@ class Agent:
 
     #生成一个用于保存 AI 计划（Plan）的 Markdown 文件的绝对路径。
     def _generate_plan_file_path(self) -> str:
-        d = Path.cwd() / ".bear" / "plan"
+        d = Path.cwd() / ".range" / "plan"
         if not d.exists():
             d.mkdir(parents=True, exist_ok=True)
         return str(d / f"plan-{self.session_id}.md")
@@ -936,7 +936,7 @@ class Agent:
     def _tier_memory(self) -> TierMem:
         """懒加载 TierMem。子 agent 不参与记忆，避免把临时任务的原文写进项目记忆。
 
-        存储目录按 ``session_id`` 隔离（``.bear/tier_memory/<session_id>/``）：
+        存储目录按 ``session_id`` 隔离（``.range/tier_memory/<session_id>/``）：
         不同会话的页、摘要与向量互不可见，也不会互相召回。
         """
         if self._tier_mem is None:
@@ -1238,7 +1238,7 @@ class Agent:
 
         # 放项目内而不是用户主目录：沙箱下主目录只给读+执行权限，mkdir 会直接
         # 抛 PermissionError（WinError 5），而这里没有任何 try 保护，会打断工具循环。
-        d = Path.cwd() / ".bear" / "tool-results"
+        d = Path.cwd() / ".range" / "tool-results"
         d.mkdir(parents=True, exist_ok=True)
         filename = f"{int(time.time() * 1000)}-{tool_name}.txt"
         filepath = d / filename

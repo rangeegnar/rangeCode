@@ -12,7 +12,7 @@ SESSION_DIRNAME = "sessions"
 
 def get_project_session_dir() -> Path:
     """返回当前项目的会话存档目录，不存在时创建。"""
-    d = Path.cwd() / ".bear" / SESSION_DIRNAME
+    d = Path.cwd() / ".range" / SESSION_DIRNAME
     d.mkdir(parents=True, exist_ok=True)
     return d
 

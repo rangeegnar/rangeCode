@@ -195,7 +195,7 @@ cython_debug/
 .task_outputs/
 .tasks/
 .teams/
-.bear/skill-evolution/
+.range/skill-evolution/
 
 # Ruff stuff:
 .ruff_cache/
@@ -235,6 +235,6 @@ analysis_progress.md
 /.workbuddy/
 /.dockerignore
 /.mcp.json
-/.bear
+/.range
 *.DS_Store
 /uv.lock

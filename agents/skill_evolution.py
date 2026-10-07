@@ -20,7 +20,7 @@ HISTORY_DIR = "history"
 
 
 def get_evolution_dir() -> Path:
-    return Path.cwd() / ".bear" / "skill-evolution"
+    return Path.cwd() / ".range" / "skill-evolution"
 
 
 def _utc_now() -> str:
@@ -233,12 +233,12 @@ def resolve_skill_file(skill_name: str, *, target: str = "active", active_dir: s
             return skill_file
 
     if target in ("project", "active"):
-        found = _find_skill_file_by_name(Path.cwd() / ".bear" / "skills", skill_name)
+        found = _find_skill_file_by_name(Path.cwd() / ".range" / "skills", skill_name)
         if found:
             return found
 
     if target in ("user", "active"):
-        found = _find_skill_file_by_name(Path.home() / ".bear" / "skills", skill_name)
+        found = _find_skill_file_by_name(Path.home() / ".range" / "skills", skill_name)
         if found:
             return found
 
@@ -248,8 +248,8 @@ def resolve_skill_file(skill_name: str, *, target: str = "active", active_dir: s
 def _skills_root(target: str) -> Path:
     target = (target or "project").strip().lower()
     if target == "user":
-        return Path.home() / ".bear" / "skills"
-    return Path.cwd() / ".bear" / "skills"
+        return Path.home() / ".range" / "skills"
+    return Path.cwd() / ".range" / "skills"
 
 
 def _normalize_context(context: str | None) -> str:

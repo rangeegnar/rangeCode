@@ -1,4 +1,4 @@
-"""运行记录落盘 —— `.bear/multiagents/<session_id>/`。
+"""运行记录落盘 —— `.range/multiagents/<session_id>/`。
 
 为什么单独一个模块：落盘和"跑编排"是两个独立的变化原因。
 编排只负责算出结果；记录放哪、什么时候建目录、写到一半崩了怎么办，
@@ -6,7 +6,7 @@
 
 目录形状：
 
-    .bear/multiagents/
+    .range/multiagents/
     └── <session_id>/
         ├── runs.jsonl                  每次运行追加一行摘要
         └── run-20261007-121733.json    单次运行的完整记录
@@ -22,7 +22,7 @@
 `session_id` 为空时退化到 `_manual` 子目录并如实记录，不静默丢弃。
 
 注意：这里的目录是**运行记录**，与 `agents/subagent.py` 读的
-`.bear/subagent/`（自定义子代理**定义**）是两回事，别混。
+`.range/subagent/`（自定义子代理**定义**）是两回事，别混。
 """
 from __future__ import annotations
 
@@ -41,8 +41,8 @@ _SKIP_SUMMARY = {"events", "results", "tasks", "verdicts", "intercepts", "final_
 
 
 def records_root(cwd: Path | str | None = None) -> Path:
-    """`.bear/multiagents` 的绝对路径。不创建目录。"""
-    return Path(cwd or Path.cwd()) / ".bear" / RECORDS_DIRNAME
+    """`.range/multiagents` 的绝对路径。不创建目录。"""
+    return Path(cwd or Path.cwd()) / ".range" / RECORDS_DIRNAME
 
 
 def session_dir(session_id: str | None, *, cwd: Path | str | None = None,

@@ -23,7 +23,7 @@ ENABLE_KEYWORD_FALLBACK = True
 
 # ═══════════════════════ 存储布局 ═══════════════════════
 
-#: 相对项目根目录的数据目录，与 agents/memory.py 的 ``.bear/memory`` 并列，互不覆盖。
+#: 相对项目根目录的数据目录，与 agents/memory.py 的 ``.range/memory`` 并列，互不覆盖。
 TIERMEM_DIRNAME = "tier_memory"
 
 #: Tier-2 追加日志文件名。页只追加、不修改、不删除。
@@ -46,17 +46,17 @@ UNIT_ID_WIDTH = 6
 
 #: 是否按会话隔离存储。
 #:
-#: True：每个会话写进 ``.bear/tier_memory/<session_id>/``。会话之间互不召回，
+#: True：每个会话写进 ``.range/tier_memory/<session_id>/``。会话之间互不召回，
 #: 可以单独删除某个会话的记忆，页号在各自目录内独立。
-#: False：所有会话共用 ``.bear/tier_memory/`` 一份索引，跨会话能互相召回，
+#: False：所有会话共用 ``.range/tier_memory/`` 一份索引，跨会话能互相召回，
 #: 但无法单独清理某个会话，页号会跨会话连续增长。
 SESSION_ISOLATION = True
 
 
 def memory_root(cwd: Path | str | None = None) -> Path:
-    """返回 TierMem 的项目级根目录（``<cwd>/.bear/tier_memory``），不存在时创建。"""
+    """返回 TierMem 的项目级根目录（``<cwd>/.range/tier_memory``），不存在时创建。"""
     base = Path(cwd) if cwd is not None else Path.cwd()
-    root = base / ".bear" / TIERMEM_DIRNAME
+    root = base / ".range" / TIERMEM_DIRNAME
     root.mkdir(parents=True, exist_ok=True)
     return root
 

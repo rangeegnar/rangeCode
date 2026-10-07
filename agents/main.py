@@ -223,7 +223,7 @@ async def run_repl(agent: Agent) -> None:
         if inp == "/skills":
             skills = discover_skills()
             if not skills:
-                print_info("No skills found. Add skills to .bear/skills/<name>/SKILL.md")
+                print_info("No skills found. Add skills to .range/skills/<name>/SKILL.md")
             else:
                 print_skill_entries(skills)
             continue

@@ -8,7 +8,7 @@
    - pytest 跑离线测试时不会刷屏
    - 脚本直接调 `execute_multiagent` 时不会乱印
    打开方式：`set_enabled(True)`，或走宿主时用 `progress=True`（见 interface）。
-3. **不引入日志框架、不写文件。** 完整轨迹在 `.bear/multiagents/<session>/*.json`，
+3. **不引入日志框架、不写文件。** 完整轨迹在 `.range/multiagents/<session>/*.json`，
    这里只负责"人在看终端时能跟上"。
 4. **不打印 state。** 每个节点自己知道哪些字段值得看，直接调 `node()/detail()` 传文本。
 5. **渲染可插拔。** 默认写纯文本到 stdout；在宿主（REPL）里调 `use_host_ui()`

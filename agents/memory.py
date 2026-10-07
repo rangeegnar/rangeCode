@@ -45,8 +45,8 @@ class MemoryEntry:
 
 
 def get_memory_dir() -> Path:
-    """返回当前项目的 memory 目录（项目根 .bear/memory），不存在时自动创建。"""
-    d = Path.cwd() / ".bear" / "memory"
+    """返回当前项目的 memory 目录（项目根 .range/memory），不存在时自动创建。"""
+    d = Path.cwd() / ".range" / "memory"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

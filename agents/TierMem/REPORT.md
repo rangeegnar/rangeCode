@@ -39,12 +39,12 @@ TierMem 的做法是把检索当成一次推理时的证据分配：**默认用�
 
 ## 三、数据模型与存储布局
 
-数据目录：`<cwd>/.bear/tier_memory/<session_id>/`，与 `agents/memory.py` 的 `.bear/memory` 并列，互不覆盖。
+数据目录：`<cwd>/.range/tier_memory/<session_id>/`，与 `agents/memory.py` 的 `.range/memory` 并列，互不覆盖。
 
 **按会话隔离。** `config.SESSION_ISOLATION = True` 时，每个会话写进自己的子目录：
 
 ```
-.bear/tier_memory/
+.range/tier_memory/
   b9e885b7/                    ← 一个会话的全部记忆，可整目录删除
     tier2_pages.jsonl
     tier1_units.json
@@ -55,11 +55,11 @@ TierMem 的做法是把检索当成一次推理时的证据分配：**默认用�
 
 目录由 `config.session_root(session_id)` 决定，`Agent._tier_memory()`（L955）传入 `self.session_id`。隔离的效果：会话之间不互相召回、页号在各自目录内从 `p000001` 独立开始、删掉一个会话不影响其他会话。
 
-关掉隔离（`SESSION_ISOLATION = False`）或 `session_id` 为空时退化为项目级共享目录 `.bear/tier_memory/`，此时所有会话共用一份索引，可跨会话召回，但无法单独清理。
+关掉隔离（`SESSION_ISOLATION = False`）或 `session_id` 为空时退化为项目级共享目录 `.range/tier_memory/`，此时所有会话共用一份索引，可跨会话召回，但无法单独清理。
 
 `--resume` 会接管被恢复会话的 `session_id`（`main.py` L421 附近），否则恢复出来的历史没有对应的记忆目录。
 
-会话存档（`agents/session.py`）同样放在项目内 `.bear/sessions/`，不放用户主目录：沙箱下主目录只授予沙箱组读 + 执行权限（`CodexSandboxUsers:(RX)`），`mkdir` 会抛 `PermissionError: [WinError 5] 拒绝访问`、写文件抛 `[Errno 13] Permission denied`，导致会话存档与 `--resume` 整条链路失效。工具大结果（`agent.py::_persist_large_result`）同理改写到 `.bear/tool-results/`——那一处没有 try 保护，会直接打断工具循环。
+会话存档（`agents/session.py`）同样放在项目内 `.range/sessions/`，不放用户主目录：沙箱下主目录只授予沙箱组读 + 执行权限（`CodexSandboxUsers:(RX)`），`mkdir` 会抛 `PermissionError: [WinError 5] 拒绝访问`、写文件抛 `[Errno 13] Permission denied`，导致会话存档与 `--resume` 整条链路失效。工具大结果（`agent.py::_persist_large_result`）同理改写到 `.range/tool-results/`——那一处没有 try 保护，会直接打断工具循环。
 
 | 文件 | 形态 | 写入方式 |
 | --- | --- | --- |
@@ -278,7 +278,7 @@ import asyncio
 from agents.TierMem import TierMem, HttpLLM
 
 memory = TierMem(
-    "./.bear/tier_memory",
+    "./.range/tier_memory",
     HttpLLM(api_base="https://.../v1", api_key="...",
             chat_model="...", embedding_model="..."),
 )
