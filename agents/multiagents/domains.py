@@ -1,14 +1,10 @@
 """领域注册表 —— 多领域分工的落点。
 
 每个领域三样东西：给规划器看的 description、给 worker 看的 system_prompt
-（含显式越界退回条款，防 MAST FM-1.2 违反角色规范）、工具白名单。
-
 引擎两种：
   lg-tool-agent   create_agent 驱动，工具转调 agents/tools.py（默认）
   plain-llm       单次模型调用，无工具
-
-写权限一律不给（没有 write_file / edit_file），也不给 run_shell —— 需要统计能力
-的领域走 repo_metrics，由编排层在进程内实现，避免把 shell 逃逸面开给自动生成的子任务。
+不提供 write_file / edit_file / run_shell —— 需要统计能力的领域走 repo_metrics，由编排层在进程内实现，避免把 shell 逃逸面开给自动生成的子任务。
 """
 from __future__ import annotations
 

@@ -1,21 +1,7 @@
 """LangGraph 编排图。
 
 拓扑（VMAO 的 Plan → Execute → Verify → Replan → Synthesize）：
-
-    START → plan → [Send 扇出 → worker*] → join → verify → (重试 | synthesize) → END
-
-两条必须遵守的 LangGraph 结构约束（都是上一轮实测踩出来的）：
-
-1. **条件边不能直接挂在 Send 的目标节点上。**
-   `worker` 是被 Send 扇出的。如果条件边挂在它上面，LangGraph 会为每个完成的
-   worker 实例各求值一次路由函数，而且拿到的是本超步写入之前的旧状态 ——
-   同一批 Send 会被并集多次。上一轮实测 4 个子任务被派发 15 次。
-   所以中间插一个普通节点 `join`，worker 只接普通边到 join，条件边挂在 join 上。
-
-2. **并行节点写入的通道必须有 reducer。** 见 state.py 的说明。
-
-`dispatch`（选批）与 `replan`（定重试）是**纯函数**，由条件边调用，不做成节点：
-它们是决策不是执行，混进节点会让边的语义不清。
+START → plan → [Send 扇出 → worker*] → join → verify → (重试 | synthesize) → END
 """
 from __future__ import annotations
 
@@ -129,7 +115,6 @@ def make_graph(budget: Budget):
         }]}
 
     # ── verify：独立验证（走验证模型）+ 停止判断 + 重规划。
-    #    守 MAST FC3.2（无验证 8.2%）与 FC3.3（错误验证 9.1%）────────
     async def verify_node(state: OrchState) -> dict[str, Any]:
         started = time.monotonic()
         tasks, results = state["tasks"], state["results"]

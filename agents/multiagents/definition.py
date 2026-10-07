@@ -1,16 +1,5 @@
-"""工具定义 —— 只有 schema，**零重依赖**。
-
-这个模块必须能单独被 import 而不拉起 langgraph / langchain。
-原因：`agents/agent.py::__init__` 需要把工具注册进 `self.tools`，
-如果那里 import 的是 `interface.py`，那么每构造一个 Agent 就会把
-整条编排依赖链（langgraph → langchain → langchain_openai）加载进来。
-
-所以拆成两个模块：
-    definition.py  只有 dict 字面量，无 import
-    interface.py   真正执行编排，延迟到工具被调用时才 import
-
-注意：包名是 `multiagents`（复数，因为里面是一个团队），工具名是
-`multiagent`（单数，因为对主 agent 来说它是一个工具）。这是刻意的。
+"""
+工具定义 —— 只有 schema。
 """
 from __future__ import annotations
 

@@ -44,7 +44,7 @@ from .online_skill_eval import format_online_skill_eval_async
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="mini-claude",
-        description="Bear Code — a minimal coding agent",
+        description="RANGE Code — a minimal coding agent",
         add_help=False,
     )
     parser.add_argument("prompt", nargs="*", help="One-shot prompt")
@@ -329,9 +329,8 @@ def main() -> None:
     _load_env_file()
 
     if args.help:
-        # 自定义帮助文本，展示 Bear Code 支持的启动参数和 REPL 内置命令。
         print("""
-Usage: bear-code [options] [prompt]
+Usage: RANGE-code [options] [prompt]
 
 Options:
   --yolo, -y          Skip all confirmation prompts (bypassPermissions mode)

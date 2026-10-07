@@ -570,7 +570,7 @@ class Agent:
         return self.permission_mode in {"bypassPermissions", "acceptEdits"}
 
     def _online_evolution_enabled(self) -> bool:
-        raw = os.environ.get("BEAR_AUTO_SKILL_EVOLUTION", "1").strip().lower()
+        raw = os.environ.get("RANGE_AUTO_SKILL_EVOLUTION", "1").strip().lower()
         return raw not in {"0", "false", "no", "off"}
 
     def _schedule_background_skill_task(self, coro) -> None:
@@ -655,7 +655,7 @@ class Agent:
             retrieved_reference=window.get("retrieved_reference") or None,
             hint=str(window.get("hint") or ""),
             confirm_write=self._confirm_online_skill_write if interactive_confirm else self._confirm_background_online_skill_write,
-            target=os.environ.get("BEAR_AUTO_SKILL_TARGET", "project"),
+            target=os.environ.get("RANGE_AUTO_SKILL_TARGET", "project"),
         )
         if result.get("ok"):
             if result.get("action") in {"add", "merge"}:
@@ -1479,10 +1479,7 @@ class Agent:
         description = task[:80] or "multi-agent orchestration"
         print_sub_agent_start("multiagent", description)
 
-        # 节点进度默认打出来（编排要跑 1-3 分钟，中间没有任何输出会让人以为卡死）。
-        # 想静默就设 BEAR_MULTIAGENT_TRACE=0。渲染走 agents/ui.py 的配色，
-        # 由 agents/multiagents/trace.py 的 use_host_ui() 挂上去。
-        progress = os.environ.get("BEAR_MULTIAGENT_TRACE", "1").strip().lower() not in {
+        progress = os.environ.get("RANGE_MULTIAGENT_TRACE", "1").strip().lower() not in {
             "0", "false", "no", "off"}
 
         try:
