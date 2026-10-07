@@ -89,6 +89,7 @@ def _get_context_windows(model:str)->int:
 
 
 #多层级压缩常数
+BUDGET_THRESHOLD = 0.50
 SNIP_THRESHOLD = 0.60
 AUTO_COMPACT_THRESHOLD = 0.70
 SNIP_PLACEHOLDER = "[Content snipped - re-read if needed]"
@@ -213,6 +214,7 @@ class Agent:
         self._archive_last_time: float = 0.0
         self._archive_count: int = 0
         self._tier_mem_bytes: int = 0
+        self._tier_ingest_cursor: int = 0 # 已写入 Tier-2 的消息条数游标, TierMem.ingest 是追加式的
         
         self._tool_error_streak: int = 0
         self._same_tool_repeat_count: int = 0
@@ -779,6 +781,13 @@ class Agent:
             self._openai_messages = _sanitize_for_utf8(data["openaiMessages"])
         if isinstance(data.get("tierMemArchives"), list):
             self._tier_mem_archives = _sanitize_for_utf8(data["tierMemArchives"])
+        # 游标必须一起恢复：只以「已入库但还没触发压缩」为目标的增量，如果被当成。已归档就会永久漏存。归一化可能改变消息条数，所以夹取一次。
+        raw_cursor = data.get("tierIngestCursor")
+        if isinstance(raw_cursor, int):
+            self._tier_ingest_cursor = max(0, min(raw_cursor, self._get_message_count()))
+        else:
+            # 旧格式会话文件没有这个字段：保守地从 0 开始（重新入库一遍，宁可重复不漏）
+            self._tier_ingest_cursor = 0
         print_info(f"Session restored ({self._get_message_count()} messages).")
 
 
@@ -851,6 +860,7 @@ class Agent:
                 "anthropicMessages": _sanitize_for_utf8(self._anthropic_messages) if not self.use_openai else None,
                 "openaiMessages": _sanitize_for_utf8(self._openai_messages) if self.use_openai else None,
                 "tierMemArchives": _sanitize_for_utf8(self._tier_mem_archives),
+                "tierIngestCursor": int(self._tier_ingest_cursor),
             })
         except Exception as exc:
             print_error(f"Session auto-save failed: {type(exc).__name__}: {exc}")
@@ -876,7 +886,7 @@ class Agent:
         payload = _sanitize_for_utf8(self._anthropic_messages)
         if not any(TierMem.message_text(m).strip() for m in payload if isinstance(m, dict)):
             return False
-        return await self._archive_messages(payload, trigger=trigger, use_openai=False)
+        return await self._archive_messages(trigger=trigger, use_openai=False)
 
     async def _archive_openai(self, *, trigger: str)->bool:
         if len(self._openai_messages) < 4:
@@ -888,9 +898,9 @@ class Agent:
         ]
         if not payload:
             return False
-        return await self._archive_messages(payload, trigger=trigger, use_openai=True)
+        return await self._archive_messages(trigger=trigger, use_openai=True)
 
-    async def _archive_messages(self, messages: list[dict], *, trigger: str, use_openai: bool) -> bool:
+    async def _archive_messages(self, *, trigger: str, use_openai: bool) -> bool:
         """把整段对话封存进 TierMem，然后用一段归档说明替换掉历史。
 
         与原来的会话折叠有本质区别：**原文没有被丢弃**。Tier-2 保留逐页原文，
@@ -904,11 +914,8 @@ class Agent:
 
         page_before = memory.store.count()
         unit_before = memory.index.count()
-        try:
-            await memory.ingest(messages, session=self.session_id)
-        except Exception as exc:
-            # 归档失败就保留原历史：宁可上下文继续变长，也不能把原文弄丢
-            print_error(f"TierMem archive failed, keeping original history: {exc}")
+        # 走同一套游标增量逻辑：已经入库的部分不再重复提交（ingest 不去重）。失败就保留原历史——宁可上下文继续变长，也不能把原文弄丢。
+        if not await self._flush_to_tier_mem():
             return False
 
         self._record_archive_event()
@@ -920,6 +927,9 @@ class Agent:
             self._openai_messages = [system_msg, {"role": "user", "content": note}]
         else:
             self._anthropic_messages = [{"role": "user", "content": note}]
+        # 历史被整体替换、位置被复用，游标必须重置，否则之后的新消息会被当成
+        # 已入库而永久漏存。顺带解决「归档说明被再次 ingest」——游标已越过这条合成消息。
+        self._tier_ingest_cursor = self._get_message_count()
         self.last_input_token_count = 0
         # 历史刚被替换，TierMem 之前注入的证据也随之消失，注入预算必须同步归零。
         # 否则 session_bytes 只增不减，耗尽后升级会在整个进程生命周期内永久失效。
@@ -1060,7 +1070,47 @@ class Agent:
         return "\n".join(lines)
 
     #多层级压缩流水线
-    def _run_compression_pipeline(self)->None:
+    def _compression_pending(self) -> bool:
+        """三道管线中是否至少有一道会动手。只读判断，不改任何内容。
+
+        取三个守卫条件的**上界**：阶段 1 在利用率 ≥ 0.50 触发、阶段 2 在 ≥ 0.60、
+        阶段 3 只看闲置时间。所以「利用率 ≥ 0.50 或闲置 ≥ 5 分钟」成立时管线才可能改动。
+        这里刻意判宽一点：代价只是多一次入库，判窄则可能出现「内容被销毁却没入库」。
+        """
+        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0.0
+        if utilization >= BUDGET_THRESHOLD:
+            return True
+        return bool(self.last_api_call_time) and (time.time() - self.last_api_call_time) >= MICROCOMPACT_IDLE_S
+
+    async def _flush_to_tier_mem(self) -> bool:
+
+        if self.is_sub_agent or not tier_config.ENABLED:
+            return True
+        memory = self._tier_memory()
+        if not memory.enabled:
+            return True
+
+        messages = self._openai_messages if self.use_openai else self._anthropic_messages
+        cursor = max(0, min(self._tier_ingest_cursor, len(messages)))
+        pending = [
+            m for m in messages[cursor:]
+            if isinstance(m, dict) and m.get("role") != "system"
+        ]
+        if pending:
+            try:
+                await memory.ingest(pending, session=self.session_id)
+            except Exception as exc:
+                # 存不成就不要压缩：宁可上下文继续变长，也不能既没存下原文又把它销毁了
+                print_error(f"TierMem pre-compression archive failed, compression skipped: {exc}")
+                return False
+        self._tier_ingest_cursor = len(messages)
+        return True
+
+    async def _run_compression_pipeline(self) -> None:
+        if not self._compression_pending():
+            return
+        if not await self._flush_to_tier_mem():
+            return
         if self.use_openai:
             self._budget_tool_results_openai()
             self._snip_stale_results_openai()
@@ -1075,7 +1125,7 @@ class Agent:
         #计算利用率：utilization = 已用Token / 有效窗口大小。
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         #如果利用率低于 50%，说明空间还很充裕，直接返回，不做任何处理。
-        if utilization < 0.5:
+        if utilization < BUDGET_THRESHOLD:
             return
         #动态预算（Budget）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 15,000 个字符。
         # 警戒状态（50%-70%）：如果利用率中等，只允许保留 30000 个字符。
@@ -1098,7 +1148,7 @@ class Agent:
         #计算利用率：utilization = 已用Token / 有效窗口大小。
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         #如果利用率低于 50%，说明空间还很充裕，直接返回，不做任何处理。
-        if utilization < 0.5:
+        if utilization < BUDGET_THRESHOLD:
             return
         #动态预算（Budget）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 15,000 个字符。
         # 警戒状态（50%-70%）：如果利用率中等，只允许保留 30000 个字符。
@@ -1461,7 +1511,8 @@ class Agent:
                 break
 
             # 每轮调用模型前尝试压缩上下文，避免消息历史过长。
-            self._run_compression_pipeline()
+            # 管线内部会先做守卫判断，必要时才把增量写入 Tier-2，再就地改写消息。
+            await self._run_compression_pipeline()
 
             # 如果记忆预取任务已经完成，就把取回来的 memory 内容追加到最后一条用户消息里。
             # consumed 用来保证同一批 memory 只注入一次。
@@ -1760,7 +1811,7 @@ class Agent:
             if self._aborted:
                 break
 
-            self._run_compression_pipeline()
+            await self._run_compression_pipeline()
 
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
                 memory_prefetch.consumed = True

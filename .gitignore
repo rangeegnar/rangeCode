@@ -237,3 +237,4 @@ analysis_progress.md
 /.mcp.json
 /.bear
 *.DS_Store
+/uv.lock
