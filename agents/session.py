@@ -19,7 +19,7 @@ def get_project_session_dir() -> Path:
 
 def save_session(session_id: str, data: dict[str, Any]) -> None:
     (get_project_session_dir() / f"{session_id}.json").write_text(
-        json.dumps(data, indent=2, default=str), encoding="utf-8"
+        json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
     )
 
 

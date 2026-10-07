@@ -16,6 +16,15 @@ import openai
 
 from agents.mcp_client import McpManager
 from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
+from agents import settings
+from agents.settings import (
+    AUTO_COMPACT_THRESHOLD, BUDGET_THRESHOLD, KEEP_RECENT_RESULTS, MICROCOMPACT_IDLE_S,
+    OLD_RESULT_CLEARED, PERSIST_PREVIEW_LINES, PERSIST_RESULT_THRESHOLD_BYTES,
+    RESPONSE_RESERVE_TOKENS, RETRY_BACKOFF_BASE_MS, RETRY_BACKOFF_CAP_MS, RETRY_MAX_ATTEMPTS,
+    SIDE_QUERY_ARCHIVE_MAX_TOKENS, SIDE_QUERY_EXTRACT_MAX_TOKENS, SIDE_QUERY_MAX_TOKENS,
+    SNIP_PLACEHOLDER, SNIP_THRESHOLD, SNIPPABLE_TOOLS,
+)
+from agents.multiagents.definition import MULTIAGENT_TOOL_DEF
 from agents.prompt import build_system_prompt
 from agents.TierMem import TierMem, config as tier_config, format_page_id
 from agents.TierMem.llm import AgentChatLLM, HttpLLM, LLMProtocol
@@ -29,7 +38,6 @@ from agents.ui import print_info, print_divider, print_assistant_text, print_sub
 
 
 # 指数退避重试
-
 
 def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
@@ -60,55 +68,18 @@ def _sanitize_for_utf8(value: Any) -> Any:
     return value
 
 
-async def _with_retry(fn, max_retries: int = 3):
+async def _with_retry(fn, max_retries: int = RETRY_MAX_ATTEMPTS):
     for attempt in range(max_retries + 1):
         try:
             return await fn()
         except Exception as error:
             if attempt >= max_retries or not _is_retryable(error):
                 raise
-            delay = min(1000 * (2 ** attempt), 30000) / 1000 + (hash(str(time.time())) % 1000) / 1000
+            delay = min(RETRY_BACKOFF_BASE_MS * (2 ** attempt), RETRY_BACKOFF_CAP_MS) / 1000 + (hash(str(time.time())) % 1000) / 1000
             status = getattr(error, "status_code", None) or getattr(error, "status", None)
             reason = f"HTTP {status}" if status else (getattr(error, "code", None) or "network error")
             print_retry(attempt + 1, max_retries, reason)
             await asyncio.sleep(delay)
-
-MODEL_CONTEXT = {
-    "claude-opus-4-6": 200000,
-    "claude-sonnet-4-6": 200000,
-    "claude-sonnet-4-20250514": 200000,
-    "claude-haiku-4-5-20251001": 200000,
-    "claude-opus-4-20250514": 200000,
-    "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
-    "deepseek-chat":200000
-}
-
-def _get_context_windows(model:str)->int:
-    return MODEL_CONTEXT.get(model, 20000) # 20000用于测试
-
-
-#多层级压缩常数
-BUDGET_THRESHOLD = 0.50
-SNIP_THRESHOLD = 0.60
-AUTO_COMPACT_THRESHOLD = 0.70
-SNIP_PLACEHOLDER = "[Content snipped - re-read if needed]"
-SNIPPABLE_TOOLS = {"read_file", "grep_search", "list_files", "run_shell"}
-MICROCOMPACT_IDLE_S = 5 * 60  # 5 minutes
-
-KEEP_RECENT_RESULTS = 3
-
-
-
-def _get_max_output_tokens(model: str) -> int:
-    m = model.lower()
-    if "opus-4-6" in m:
-        return 64000
-    if "sonnet-4-6" in m:
-        return 32000
-    if any(x in m for x in ("opus-4", "sonnet-4", "haiku-4")):
-        return 32000
-    return 16384
 
 #转换tool的形式到openai
 def _to_openai_tools(tools: list[ToolDef]) -> list[dict]:
@@ -144,41 +115,39 @@ class Agent:
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
-        # 这三项由 agents/main.py 解析后注入，TierMem 直接复用，不自己读环境变量
         self.api_base = api_base or anthropic_base_url
         self.api_key = api_key
         self.embedding_model = embedding_model or ""
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
         self.tools = custom_tools or tool_definitions
+        # 多智能体编排工具
+        if not is_sub_agent and permission_mode != "plan" and self.use_openai:
+            self.tools = self.tools + [MULTIAGENT_TOOL_DEF]
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
         self._custom_system_prompt = custom_system_prompt
-        self.effective_window=_get_context_windows(model) -20000
+        self.effective_window=settings.context_window(model) - RESPONSE_RESERVE_TOKENS
         self.session_id = uuid.uuid4().hex[:8]
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
-
+        # 用量统计
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.last_input_token_count = 0
         self.current_turns = 0
         self.last_api_call_time = 0
-
-
+        # 是否终止
         self._aborted = False
         #存储异步任务
         self._current_task:asyncio.Task | None = None
         #权限白名单
         self._confirmed_paths: set[str] = set()
-
-
         # 计划模式”（Plan Mode）状态的变量
         self._pre_plan_mode: str | None=None
         self._plan_file_path: str | None=None
         self._plan_approval_fn : Callable[[str], Awaitable[bool]] | None=None
         self._context_cleared : bool=False
-
         #思考模式
         self._thinking_mode = self._resolve_thinking_mode()
 
@@ -206,15 +175,15 @@ class Agent:
         self._last_retrieved_skill_hits: list[dict[str, Any]] = []
         self._pending_skill_extraction_window: dict[str, Any] | None = None
         self._background_skill_tasks: set[asyncio.Task] = set()
-        # TierMem 两级记忆：会话原文封存成不可变的 Tier-2 页 + 带溯源的 Tier-1 摘要。
-        # 取代原先的 session_memory 会话折叠——折叠会把原文删掉，TierMem 不会。
+        # TierMem
         self._tier_mem: TierMem | None = None
         self._tier_mem_archives: list[dict[str, Any]] = []
         self._background_tier_tasks: set[asyncio.Task] = set()
         self._archive_last_time: float = 0.0
         self._archive_count: int = 0
         self._tier_mem_bytes: int = 0
-        self._tier_ingest_cursor: int = 0 # 已写入 Tier-2 的消息条数游标, TierMem.ingest 是追加式的
+        # Tier-2 的消息条数游标
+        self._tier_ingest_cursor: int = 0
         
         self._tool_error_streak: int = 0
         self._same_tool_repeat_count: int = 0
@@ -269,10 +238,9 @@ class Agent:
 
     #生成一个用于保存 AI 计划（Plan）的 Markdown 文件的绝对路径。
     def _generate_plan_file_path(self) -> str:
-        # 放项目内而不是 ~/.bear：沙箱下用户主目录只给读+执行权限，mkdir 会抛
-        # PermissionError: [WinError 5]。
         d = Path.cwd() / ".bear" / "plan"
-        d.mkdir(parents=True, exist_ok=True)
+        if not d.exists():
+            d.mkdir(parents=True, exist_ok=True)
         return str(d / f"plan-{self.session_id}.md")
 
     def _build_plan_mode_prompt(self) -> str:
@@ -302,7 +270,7 @@ class Agent:
         return self._current_task is not None and not self._current_task.done()
 
     #大模型调用的工厂方法,构建一个用于记忆召回（memory recall）的 sideQuery 可调用对象，兼容anthropic, openai。
-    def _build_side_query(self, *, max_tokens: int = 256):
+    def _build_side_query(self, *, max_tokens: int = SIDE_QUERY_MAX_TOKENS):
         if self._anthropic_client:
             client = self._anthropic_client
             model = self.model
@@ -405,7 +373,7 @@ class Agent:
     #主入口
 
     async def  chat(self, user_message:str)->None:
-        #懒加载MCP服务在第一次chat的时候
+        # 在第一次chat的时候 -> 懒加载MCP服务
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
             try:
@@ -617,10 +585,11 @@ class Agent:
 
         def _done(done_task: asyncio.Task) -> None:
             self._background_skill_tasks.discard(done_task)
-            try:
-                done_task.result()
-            except Exception:
-                pass
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                print_error(f"Background skill task failed: {type(exc).__name__}: {exc}")
 
         task.add_done_callback(_done)
 
@@ -671,7 +640,7 @@ class Agent:
         if not messages:
             return
 
-        side_query = self._build_side_query(max_tokens=2200)
+        side_query = self._build_side_query(max_tokens=SIDE_QUERY_ARCHIVE_MAX_TOKENS)
         if side_query is None:
             return
 
@@ -701,7 +670,7 @@ class Agent:
         hits = list(self._last_retrieved_skill_hits or [])
         if not hits or not assistant_text.strip():
             return
-        side_query = self._build_side_query(max_tokens=700)
+        side_query = self._build_side_query(max_tokens=SIDE_QUERY_EXTRACT_MAX_TOKENS)
         try:
             from .online_skill_evolution import judge_retrieved_skill_usage
             from .skills import record_usage_judgments
@@ -1229,24 +1198,24 @@ class Agent:
             if msg.get("role")!="user" or not isinstance(msg.get("content"), list):
                 continue
             for bindex, block in enumerate(msg["content"]):
-                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and block["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
+                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and block["content"] not in (SNIP_PLACEHOLDER, OLD_RESULT_CLEARED):
                     all_results.append((mindex, bindex))
 
         clear_count = len(all_results) - KEEP_RECENT_RESULTS
         for i in range(max(0, clear_count)):
             mi, bi = all_results[i]
-            self._anthropic_messages[mi]["content"][bi]["content"] = "[Old result cleared]"
+            self._anthropic_messages[mi]["content"][bi]["content"] = OLD_RESULT_CLEARED
 
     def _microcompact_openai(self) -> None:
         if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
             return
         tool_msgs = []
         for i, msg in enumerate(self._openai_messages):
-            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] not in (SNIP_PLACEHOLDER, OLD_RESULT_CLEARED):
                 tool_msgs.append(i)
         clear_count = len(tool_msgs) - KEEP_RECENT_RESULTS
         for i in range(max(0, clear_count)):
-            self._openai_messages[tool_msgs[i]]["content"] = "[Old result cleared]"
+            self._openai_messages[tool_msgs[i]]["content"] = OLD_RESULT_CLEARED
 
     def _find_tool_use_by_id(self, tool_use_id: int) -> dict | None:
         for msg in self._anthropic_messages:
@@ -1262,9 +1231,9 @@ class Agent:
     # 然后在对话里只留一个‘文件路径’和‘内容预览’。如果模型后面还需要看完整内容，它可以再次调用工具去读取这个文件
 
     def _persist_large_result(self, tool_name: str, result: str) -> str:
-        THRESHOLD = 30 * 1024  # 30 KB
+        #阈值与预览行数都定义在 agents/settings.py，改一处即生效
         #转换成字节
-        if (len (result.encode())) <= THRESHOLD:
+        if (len (result.encode())) <= PERSIST_RESULT_THRESHOLD_BYTES:
             return result
 
         # 放项目内而不是用户主目录：沙箱下主目录只给读+执行权限，mkdir 会直接
@@ -1276,14 +1245,14 @@ class Agent:
         filepath.write_text(result, encoding="utf-8")
 
         lines = result.split("\n")
-        preview = "\n".join(lines[:200])
+        preview = "\n".join(lines[:PERSIST_PREVIEW_LINES])
         size_kb = len(result.encode()) / 1024
 
         return (
             f"[Result too large ({size_kb:.1f} KB, {len(lines)} lines). "
             f"Full output saved to {filepath}. "
             f"You can use read_file to see the full result.]\n\n"
-            f"Preview (first 200 lines):\n{preview}"
+            f"Preview (first {PERSIST_PREVIEW_LINES} lines):\n{preview}"
         )
 
     #执行工具入口
@@ -1295,6 +1264,8 @@ class Agent:
             return await self._execute_plan_mode_tool(name)
         if name == "agent":
             return await self._execute_agent_tool(inp)
+        if name == "multiagent":
+            return await self._execute_multiagent_tool(inp)
         if name == "skill":
             return await self._execute_skill_tool(inp)
             # Route MCP tool calls to the MCP manager
@@ -1480,6 +1451,63 @@ class Agent:
         except Exception as e:
             print_sub_agent_end(agent_type, description)
             return f"Sub-agent error: {e}"
+
+    async def _execute_multiagent_tool(self, inp: dict) -> str:
+        """多领域多智能体编排。与 `agent` 工具同级，但走的是编排层（Plan-Execute-Verify-Replan-Synthesize）。
+
+        与 `_execute_agent_tool` 的三处关键差异：
+          1. 延迟 import 编排入口 —— 构造 Agent 时不付出 langgraph 的加载代价。
+          2. token 由编排层回传后**精确**记进父计数器（input/output 分开），
+             否则这十几万 token 不会出现在 show_cost()，也进不了预算门禁。
+          3. 失败不吞成一句 "error"，而是把类型、原因和**失败记录目录**一起交出去 ——
+             目录里有完整 traceback。
+
+        `host_*` 的作用是让编排的执行槽位跟随主 agent 的模型（CLI `--model` 覆盖时
+        两边不能不一致）。验证槽位仍由编排层从 .env 的 MODEL4TEST 取，不接受覆盖 ——
+        "执行与验证用不同模型"是这套设计的前提。
+        """
+        from agents.multiagents import records as ma_records
+        from agents.multiagents.interface import execute_multiagent_with_usage
+
+        # 一次编排是十五万 token 量级的集中支出，已经超预算时就别开跑
+        budget_state = self._check_budget()
+        if budget_state["exceeded"]:
+            return (f"Refused: {budget_state['reason']}. A multiagent run costs on the order "
+                    "of 100k-200k tokens, so it is not started once the budget is exhausted.")
+
+        task = str(inp.get("task") or "").strip()
+        description = task[:80] or "multi-agent orchestration"
+        print_sub_agent_start("multiagent", description)
+
+        # 节点进度默认打出来（编排要跑 1-3 分钟，中间没有任何输出会让人以为卡死）。
+        # 想静默就设 BEAR_MULTIAGENT_TRACE=0。渲染走 agents/ui.py 的配色，
+        # 由 agents/multiagents/trace.py 的 use_host_ui() 挂上去。
+        progress = os.environ.get("BEAR_MULTIAGENT_TRACE", "1").strip().lower() not in {
+            "0", "false", "no", "off"}
+
+        try:
+            text, usage = await execute_multiagent_with_usage(
+                inp,
+                session_id=self.session_id,
+                host_model=self.model,
+                host_api_base=self.api_base,
+                host_api_key=self.api_key,
+                host_embedding_model=self.embedding_model,
+                progress=progress,
+            )
+        except Exception as e:
+            print_sub_agent_end("multiagent", description)
+            # 编排层已经把失败记录写进会话目录了，这里把位置一并交代出去
+            where = ma_records.session_dir(self.session_id)
+            return (f"Multiagent run failed: {type(e).__name__}: {e}\n"
+                    f"Failure record (contains the full traceback) is under {where}. "
+                    "Tell the user the run did not complete; do not answer from partial results.")
+
+        self.total_input_tokens += int(usage.get("input", 0) or 0)
+        self.total_output_tokens += int(usage.get("output", 0) or 0)
+        self._record_tool_outcome("multiagent", True)
+        print_sub_agent_end("multiagent", description)
+        return text or "(Multiagent produced no output)"
 
 #--------------Anthropic 后端---------------
     async def  _chat_anthropic(self, user_message: str) -> None:
@@ -1704,11 +1732,14 @@ class Agent:
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
 
         async def _do():
-            max_output =  _get_max_output_tokens(self.model)
+            max_output =  settings.max_output_tokens(self.model)
 
             create_params: dict[str, Any] = {
                 "model": self.model,
-                "max_tokens": max_output if self._thinking_mode != "disabled" else 16384,
+                # 上限统一由 agents/settings.py 解析（.env 的 MODEL_MAX_OUTPUT /
+                # MODEL4TEST_MAX_OUTPUT → 按角色默认值 → 通用兜底）。
+                # 原来非思考模式写死 16384，会让 .env 里配的值在默认情况下完全不生效。
+                "max_tokens": max_output,
                 "system": _safe_utf8_text(self._system_prompt),
                 "tools": _sanitize_for_utf8(get_active_tool_definitions(self.tools)),
                 "messages": _sanitize_for_utf8(self._anthropic_messages),
@@ -1904,59 +1935,59 @@ class Agent:
                     self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
-                oai_batches: list[dict] = []
-                for ct in oai_checked:
-                    safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
-                    if safe and oai_batches and oai_batches[-1]["concurrent"]:
-                        oai_batches[-1]["items"].append(ct)
-                    else:
-                        oai_batches.append({"concurrent": safe, "items": [ct]})
+            oai_batches: list[dict] = []
+            for ct in oai_checked:
+                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+                if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                    oai_batches[-1]["items"].append(ct)
+                else:
+                    oai_batches.append({"concurrent": safe, "items": [ct]})
 
-                oai_context_break = False
-                for batch in oai_batches:
-                    if oai_context_break or self._aborted:
-                        break
+            oai_context_break = False
+            for batch in oai_batches:
+                if oai_context_break or self._aborted:
+                    break
 
-                    if batch["concurrent"]:
-                        async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                            raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct_item["fn"], raw)
-                            print_tool_result(ct_item["fn"], res)
-                            return ct_item, res
+                if batch["concurrent"]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                        raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                        raw = _safe_utf8_text(raw)
+                        res = self._persist_large_result(ct_item["fn"], raw)
+                        print_tool_result(ct_item["fn"], res)
+                        return ct_item, res
 
-                        results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res in results:
-                            self._record_tool_outcome(
-                                ct_item["fn"],
-                                not self._looks_like_tool_failure(ct_item["fn"], "", res),
-                            )
+                    results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
+                    for ct_item, res in results:
+                        self._record_tool_outcome(
+                            ct_item["fn"],
+                            not self._looks_like_tool_failure(ct_item["fn"], "", res),
+                        )
+                        self._openai_messages.append(
+                            {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                else:
+                    for ct in batch["items"]:
+                        if not ct["allowed"]:
                             self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
-                    else:
-                        for ct in batch["items"]:
-                            if not ct["allowed"]:
-                                self._openai_messages.append(
-                                    {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
-                                continue
+                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                            continue
 
-                            raw = await self._execute_tool_call(ct["fn"], ct["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct["fn"], raw)
-                            print_tool_result(ct["fn"], res)
-                            self._record_tool_outcome(
-                                ct["fn"],
-                                not self._looks_like_tool_failure(ct["fn"], raw, res),
-                            )
+                        raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        raw = _safe_utf8_text(raw)
+                        res = self._persist_large_result(ct["fn"], raw)
+                        print_tool_result(ct["fn"], res)
+                        self._record_tool_outcome(
+                            ct["fn"],
+                            not self._looks_like_tool_failure(ct["fn"], raw, res),
+                        )
 
-                            if self._context_cleared:
-                                self._context_cleared = False
-                                self._openai_messages.append({"role": "user", "content": res})
-                                oai_context_break = True
-                                break
+                        if self._context_cleared:
+                            self._context_cleared = False
+                            self._openai_messages.append({"role": "user", "content": res})
+                            oai_context_break = True
+                            break
 
-                            self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+                        self._openai_messages.append(
+                            {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
             self._context_cleared = False
             self._refresh_runtime_system_prompt()
@@ -1964,8 +1995,12 @@ class Agent:
 
     async def _call_openai_stream(self) -> dict:
         async def _do():
+            # OpenAI 兼容路径原来完全不发 max_tokens，由服务端决定返回长度。
+            # 现在显式发出去，来源是 agents/settings.py（.env 的
+            # MODEL_MAX_OUTPUT / MODEL4TEST_MAX_OUTPUT → 按角色默认值 → 通用兜底）。
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
+                max_tokens=settings.max_output_tokens(self.model),
                 tools=_sanitize_for_utf8(_to_openai_tools(get_active_tool_definitions(self.tools))),
                 messages=_sanitize_for_utf8(self._openai_messages),
                 stream=True,

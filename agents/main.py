@@ -27,6 +27,8 @@ from .ui import (
 )
 from .session import load_session, get_latest_session_id
 from .memory import list_memories
+# 环境变量清洗的唯一实现在 agents/settings.py（本模块曾有一份同义复制）
+from .settings import clean_env as _clean_env
 from .skills import (
     create_skill,
     discover_skills,
@@ -72,17 +74,8 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     return "default"
 
 
-def _clean_env(value: str | None) -> str | None:
-    """去掉首尾空白与行尾注释。
-
-    行尾注释必须剥掉：dotenv 会把 ``KEY=value # note`` 的整行（含注释）放进
-    ``os.environ``。若整行被当成模型名或 base URL 发出去，接口会直接 401/400。
-    这里是全项目解析环境变量的唯一出口，所以在这一层统一处理。
-    """
-    if value is None:
-        return None
-    value = value.split("#")[0].strip()
-    return value or None
+# `_clean_env` 不再在本文件定义：实现已收敛到 agents/settings.py，
+# 文件顶部以 `from .settings import clean_env as _clean_env` 引入。
 
 
 def _load_env_file() -> None:

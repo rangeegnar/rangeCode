@@ -368,6 +368,38 @@ def print_sub_agent_end(agent_type: str, _description: str) -> None:
     )
 
 
+# ─── multiagent 编排进度 ────────────────────────────────────
+# 由 agents/multiagents/trace.py 的 use_host_ui() 挂上去。用 Text 而不是
+# f-string + markup：节点文本里有 `[code]`、`[... 监督层净化 ...]` 这种方括号，
+# 走 markup 会被 rich 当成标签解析，轻则丢字符重则报错。
+MULTIAGENT_NODE_ICON = {
+    "plan": "◆",
+    "route": "→",
+    "worker": "▸",
+    "join": "┄",
+    "verify": "✓",
+    "synthesize": "★",
+}
+
+_MULTIAGENT_LABEL_WIDTH = 24
+
+
+def print_multiagent_node(node: str, text: str) -> None:
+    """编排层一个节点的一行主输出。"""
+    line = Text()
+    line.append(f"{MULTIAGENT_NODE_ICON.get(node, '•')} ", style=f"bold {COLOR_ACCENT}")
+    line.append("multiagent ", style=COLOR_SECONDARY)
+    line.append(f"{node:<10}", style=f"bold {COLOR_ACCENT}")
+    line.append(" ")
+    line.append(_safe_text(text), style=COLOR_TEXT)
+    console.print(line)
+
+
+def print_multiagent_detail(text: str) -> None:
+    """编排层节点下的细节行。"""
+    console.print(Text(" " * _MULTIAGENT_LABEL_WIDTH + _safe_text(text), style=COLOR_DIM))
+
+
 def print_memory_entries(memories: list[object]) -> None:
     table = Table(box=box.ROUNDED, header_style=f"bold {COLOR_ACCENT}", border_style=COLOR_SECONDARY)
     table.add_column("Type", style=f"bold {COLOR_ACCENT}", no_wrap=True)

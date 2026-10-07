@@ -11,6 +11,8 @@ from pathlib import Path
 from tqdm.utils import IS_WIN
 
 from agents.memory import get_memory_dir
+# 工具结果截断的两个阈值定义在 agents/settings.py（全项目唯一来源）
+from agents.settings import MAX_RESULT_CHARS, TRUNCATE_MARKER_RESERVE_CHARS
 
 ToolDef = dict  # Anthropic tool schema dict
 #权限模式
@@ -393,8 +395,10 @@ def _grep_search(inp: dict) -> str:
                 args.append(f"--include={include}")
             args.extend(["--", pattern, path])
 
+            # 与 _run_shell 同样的理由：显式指定 UTF-8，并容忍脏字节。
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=10
+                args, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=10
             )
             if result.returncode == 1:
                 return "No matches found."
@@ -453,13 +457,10 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
 
 #--------截断过长的工具调用结果
 
-MAX_RESULT_CHARS = 50000
-
-
 def _truncate_result(result:str) -> str:
     if len(result) <= MAX_RESULT_CHARS:
         return result
-    keep_each = (MAX_RESULT_CHARS - 60) // 2
+    keep_each = (MAX_RESULT_CHARS - TRUNCATE_MARKER_RESERVE_CHARS) // 2
     return (
         result[:keep_each]
         +f"\n\n[... truncated {len(result) - keep_each * 2} chars ...]\n\n"
@@ -496,11 +497,21 @@ def _run_shell(inp: dict) -> str:
     try:
         timeout_ms = inp.get("timeout", 30000)
         timeout_s = timeout_ms / 1000
+        # encoding 必须显式写出来。text=True 不给 encoding 时用的是
+        # locale.getpreferredencoding()，中文 Windows 上是 cp936(GBK)，而子进程
+        # （git log、python 脚本……）输出的是 UTF-8。
+        # 关键在于失败方式很隐蔽：解码异常只在 subprocess 的 reader 线程里抛出，
+        # 主线程不抛，拿到的是 stdout=None 且 returncode=0，于是下面
+        # `result.stdout or ""` 会静默返回 "(no output)" —— 命令明明成功了，
+        # 却告诉模型"没有输出"。这个 bug 已在 PYTHONUTF8=0 下完整复现过。
+        # errors="replace"：一个坏字节不该让整条命令的输出全部丢掉。
         result = subprocess.run(
             inp["command"],
             shell=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_s,
         )
         output = result.stdout or ""
@@ -639,6 +650,9 @@ def check_permission(
             return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
         if tool_name == "run_shell":
             return {"action": "deny", "message": "Shell commands blocked in plan mode"}
+        if tool_name == "multiagent":
+            return {"action": "deny",
+                    "message": "Blocked in plan mode: multiagent executes workers and writes run records"}
 
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
         return {"action": "allow"}
