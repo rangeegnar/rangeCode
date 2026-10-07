@@ -46,7 +46,7 @@ RANGE_BANNER = r"""
 
 def print_welcome() -> None:
     title = Text("R A N G E   C O D E", style=f"bold {COLOR_ACCENT}")
-    subtitle = Text("Autonomous Evolvable Coding Runtime", style=f"dim {COLOR_TEXT}")
+    subtitle = Text("Self-Evolving Multi-Agent Coding Runtime via Provenance-Aware Memory & Verification Gates", style=f"dim {COLOR_TEXT}")
     banner = Text(RANGE_BANNER, style=f"bold {COLOR_SECONDARY}")
 
     commands = Table.grid(padding=(0, 2))
@@ -56,8 +56,8 @@ def print_welcome() -> None:
     commands.add_row("/skills", "Inspect installed agent capabilities")
     commands.add_row("/skill-create", "Synthesize a new autonomous skill")
     commands.add_row("/skill-stats", "Inspect capability evolution metrics")
-    commands.add_row("/memory", "Access episodic & semantic memory matrix")
-    commands.add_row("/compact", "Prune & compress context window")
+    commands.add_row("/memory", "Access your long memory")
+    commands.add_row("/compact", "Prune & compress context window & TrieMem")
     commands.add_row("exit", "Terminate active session")
 
     body = Table.grid()
@@ -369,9 +369,6 @@ def print_sub_agent_end(agent_type: str, _description: str) -> None:
 
 
 # ─── multiagent 编排进度 ────────────────────────────────────
-# 由 agents/multiagents/trace.py 的 use_host_ui() 挂上去。用 Text 而不是
-# f-string + markup：节点文本里有 `[code]`、`[... 监督层净化 ...]` 这种方括号，
-# 走 markup 会被 rich 当成标签解析，轻则丢字符重则报错。
 MULTIAGENT_NODE_ICON = {
     "plan": "◆",
     "route": "→",
