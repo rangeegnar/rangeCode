@@ -304,17 +304,9 @@ class McpManager:
         """按优先级加载并合并 MCP Server 配置。"""
         merged: dict[str, dict] = {}
 
-        # 1. 全局配置：~/.bear/settings.json
-        global_path = Path.home() / ".bear" / "settings.json"
-        self._merge_config_file(global_path, merged)
-
-        # 2. 当前项目配置：<cwd>/.bear/settings.json
-        project_path = Path.cwd() / ".bear" / "settings.json"
+        # 项目配置：<cwd>/.bear/mcp/settings.json
+        project_path = Path.cwd() / ".bear" / "mcp" / "settings.json"
         self._merge_config_file(project_path, merged)
-
-        # 3. Claude Code 约定配置：<cwd>/.mcp.json
-        mcp_json_path = Path.cwd() / ".mcp.json"
-        self._merge_config_file(mcp_json_path, merged)
 
         return merged
 
